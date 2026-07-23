@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <RootNamespace>AgenteBiometricoPresencial</RootNamespace>
+    <AssemblyName>AgenteBiometricoPresencial</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Fleck" Version="1.2.0" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+  <!-- Referencia al ensamblado Managed de RealPassSDK si está presente en C:\Program Files\Xperix -->
+  <ItemGroup Condition="Exists('C:\Program Files\Xperix\RealPassSDK\Bin\x64\Xperix.RealPassSDK.dll')">
+    <Reference Include="Xperix.RealPassSDK">
+      <HintPath>C:\Program Files\Xperix\RealPassSDK\Bin\x64\Xperix.RealPassSDK.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>
