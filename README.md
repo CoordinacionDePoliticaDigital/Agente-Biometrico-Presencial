@@ -1,58 +1,114 @@
-# Agente Biométrico Presencial (Middleware WebSocket C# / .NET)
+# Agente Biométrico Presencial v2.0
+## Middleware WebSocket C# .NET 8 — Autoridad Certificadora (Gobierno del Estado de Chihuahua)
 
-Servicio de fondo local (Windows Service / Daemon .NET) para la estación del Agente Enrolador de la **Autoridad Certificadora (Gobierno del Estado de Chihuahua)**.
-
-Este middleware actúa como puente entre el cliente web Frontend (Svelte en Tier 1) y los SDKs/DLLs C++ nativos instalados en la PC bajo `C:\Program Files\Xperix`.
+Servicio de fondo local (Windows, .NET 8) que actúa como puente entre el frontend Svelte y los SDKs/DLLs nativos de Xperix instalados en la PC del Agente Enrolador.
 
 ---
 
-## 🏗️ Arquitectura del Servicio
+## 🏗️ Arquitectura
 
 ```
-+------------------------+                        +----------------------------------+
-|  Svelte Web Frontend   |                        |  Agente Biométrico Local (C#)    |
-|   (Tier 1 - Browser)   |                        |   WebSocket Server (Port 8443)   |
-+------------------------+                        +----------------------------------+
-            |                                                      |
-            |------------ Connect (wss://127.0.0.1:8443) --------->|
-            |<----------- Handshake & Status OK -------------------|
-            |                                                      |
-            |------------ JSON: START_FINGERPRINT ---------------->|---- P/Invoke RS_SDK.dll
-            |<----------- Event: FINGERPRINT_CAPTURED -------------|     (RealScan G10)
-            |                                                      |
-            |------------ JSON: START_DOCUMENT_SCAN -------------->|---- Xperix.RealPassSDK.dll
-            |<----------- Event: DOCUMENT_SCANNED -----------------|     (RealPass RPNF)
+[Browser Svelte Frontend]  ←──── ws://127.0.0.1:8443 ────→  [AgenteBiometricoPresencial.exe]
+                                                                   ├─ DeviceStatusMonitor.cs  (WMI/USB polling cada 5s)
+                                                                   ├─ Drivers/RealScanDriver.cs  → P/Invoke RS_SDK.dll
+                                                                   └─ Drivers/RealPassDriver.cs → Xperix.RealPassSDK.dll
 ```
 
 ---
 
-## 🔌 Dispositivos Biométricos Soportados
+## 🔌 Protocolo WebSocket JSON
 
-1. **Xperix / Suprema RealScan G10**:
-   - Escáner dactilar de 10 huellas (Slap scanner 4+4+2).
-   - Generación de imágenes y plantillas ISO/IEC 19794-2 y compresión WSQ con calidad NFIQ (1-5).
-   - DLL: `C:\Program Files\Xperix\RealScanSDK\Bin\x64\RS_SDK.dll`
+### Comandos (Frontend → Agente)
 
-2. **Xperix RealPass RPNF**:
-   - Lector de documentos de identidad y pasaportes electrónicos.
-   - Extracción de texto MRZ (ICAO 9303), lectura de chip RFID NFC e imágenes (Luz Blanca, Infrarroja, Ultravioleta).
-   - DLL: `C:\Program Files\Xperix\RealPassSDK\Bin\x64\Xperix.RealPassSDK.dll`
+| `command` | Parámetros | Descripción |
+|---|---|---|
+| `GET_DEVICE_STATUS` | — | Solicita estado de todos los periféricos |
+| `START_FINGERPRINT_CAPTURE` | `fingerGroup`, `skipFingers`, `timeoutSeconds` | Captura slap 4+4+2 |
+| `START_DOCUMENT_SCAN` | `spectralMode`, `readRfid`, `timeoutSeconds` | Escaneo de documento |
+| `ABORT_CAPTURE` | `sessionId` | Aborta captura activa |
+
+### Eventos (Agente → Frontend)
+
+| `event_type` | Cuándo |
+|---|---|
+| `CONNECTED_HANDSHAKE` | Al conectar. Incluye versión y estado inicial de periféricos |
+| `DEVICE_STATUS_UPDATE` | Cambio de estado en cualquier periférico |
+| `AGENT_HEARTBEAT` | Cada 5s — mantiene viva la conexión |
+| `FINGERPRINT_CAPTURED` | Huella slap capturada (WSQ Base64 + NFIQ) |
+| `DOCUMENT_SCANNED` | MRZ + imágenes multiespectrales |
+| `CAPTURE_ERROR` | Error o timeout durante captura |
+| `CAPTURE_ABORTED` | Captura abortada por comando del cliente |
+
+---
+
+## ⚠️ Política de Simulación
+
+**NO hay simulación por defecto.** Si los dispositivos no están presentes el agente reporta el estado real:
+
+| Condición | `statusCode` | `isConnected` |
+|---|---|---|
+| SDK no instalado | `DRIVER_MISSING` | `false` |
+| SDK presente, device desconectado | `DISCONNECTED` | `false` |
+| Error de SDK | `ERROR` | `false` |
+| Device presente y listo | `READY` | `true` |
+
+El modo simulación **solo** se activa con el flag `--simulate`:
+```powershell
+dotnet run --project Src/AgenteBiometrico.csproj -- --simulate
+```
 
 ---
 
 ## 🛠️ Requisitos del Sistema
-- **Sistema Operativo**: Windows 10/11 x64
-- **Entorno de Ejecución**: .NET 8.0 SDK / Runtime
-- **SDKs de Fabricante**: Xperix RealScan SDK v2.0+ y RealPass SDK v3.2+ en `C:\Program Files\Xperix\`
+
+- **OS**: Windows 10/11 x64
+- **Runtime**: .NET 8.0 (SDK para compilar, Runtime para ejecutar)
+- **SDKs Xperix**: 
+  - `C:\Program Files\Xperix\RealScanSDK\Bin\x64\RS_SDK.dll`
+  - `C:\Program Files\Xperix\RealPassSDK\Bin\x64\Xperix.RealPassSDK.dll`
 
 ---
 
 ## 🚀 Compilación y Ejecución
 
-```bash
-# Compilar proyecto en modo Release x64
-dotnet build -c Release -r win-x64
+```powershell
+# Instalar .NET 8 SDK si no está instalado (requiere administrador)
+winget install Microsoft.DotNet.SDK.8
 
-# Ejecutar el servicio interactivo
+# Compilar
+dotnet build Src/AgenteBiometrico.csproj -c Release
+
+# Ejecutar (producción — hardware real requerido)
 dotnet run --project Src/AgenteBiometrico.csproj
+
+# Ejecutar con simulación (pruebas de integración sin hardware)
+dotnet run --project Src/AgenteBiometrico.csproj -- --simulate
+
+# Puerto alternativo
+dotnet run --project Src/AgenteBiometrico.csproj -- --port=9443
+```
+
+---
+
+## 📋 Diagnóstico al Arranque
+
+Al iniciar, el agente imprime en consola:
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║      AGENTE BIOMÉTRICO PRESENCIAL  v2.0.0                    ║
+║      Middleware WebSocket — Autoridad Certificadora           ║
+║      RealScan G10  •  RealPass RPNF  •  Puerto 8443          ║
+╚══════════════════════════════════════════════════════════════╝
+
+[USB Diagnóstico] Enumerando dispositivos USB Xperix...
+  [✓] RealScan G10 (VID: VID_16D1): Detectado en USB
+  [✗] RealPass RPNF (VID: VID_0525): No detectado
+
+[Drivers] Inicializando controladores de hardware...
+  ✓ RealScan G10: RealScan G10 inicializado. Dispositivos detectados: 1
+  ✗ RealPass RPNF: No se encontró Xperix.RealPassSDK.dll en C:\Program Files\Xperix\...
+
+[INFO] WebSocket escuchando en ws://127.0.0.1:8443
+[INFO] Presiona CTRL+C para detener.
 ```
