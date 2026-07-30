@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using System.Threading;
 using Fleck;
 using Newtonsoft.Json;
@@ -20,6 +21,16 @@ namespace AgenteBiometricoPresencial.Server
     {
         private const string AGENT_VERSION = "2.0.0";
         private const int HEARTBEAT_INTERVAL_SEC = 5;
+
+        // Directorio de DLLs del RealScan SDK (necesario para opencv, tensorflow, etc.)
+        private const string REALSCAN_DLL_DIR = @"C:\Program Files\Xperix\RealScanSDK\Bin\x64";
+
+        // P/Invoke para agregar el directorio del SDK al search path de DLLs nativas
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool SetDllDirectory(string lpPathName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool AddDllDirectory(string lpPathName);
 
         private WebSocketServer? _server;
         private readonly ConcurrentDictionary<Guid, IWebSocketConnection> _clients = new();
@@ -41,16 +52,20 @@ namespace AgenteBiometricoPresencial.Server
             if (simulationMode)
                 Console.WriteLine("\n  ⚠  MODO SIMULACIÓN ACTIVO — No se usará hardware real\n");
 
-            // Configurar y arrancar el monitor de periféricos
+            // Agregar el directorio de DLLs del SDK al search path ANTES de cargar el driver
+            if (System.IO.Directory.Exists(REALSCAN_DLL_DIR))
+            {
+                SetDllDirectory(REALSCAN_DLL_DIR);
+                Console.WriteLine($"[INFO] DLL search path → {REALSCAN_DLL_DIR}");
+            }
+
+            // Configurar y arrancar el monitor de periféricos (usa ProbeDevice, no Initialize)
             _monitor = new DeviceStatusMonitor(_realScan, _realPass);
             _monitor.OnStatusChanged += BroadcastDeviceStatusUpdate;
             _monitor.Start();
 
-            // Inicializar drivers para capturas (solo intentan cargar el SDK real)
-            InitializeDrivers();
-
             // Configurar servidor Fleck
-            FleckLog.Level = LogLevel.Warn; // Reducir verbosidad de Fleck en consola
+            FleckLog.Level = LogLevel.Warn;
             _server = new WebSocketServer($"ws://0.0.0.0:{port}");
 
             _server.Start(socket =>
@@ -70,6 +85,10 @@ namespace AgenteBiometricoPresencial.Server
             );
 
             Console.WriteLine($"[INFO] WebSocket escuchando en ws://127.0.0.1:{port}");
+
+            // Inicializar drivers DESPUÉS de que el WebSocket ya esté escuchando
+            // Así un fallo del SDK no impide que el agente arranque
+            InitializeDrivers();
         }
 
         public void Stop()
@@ -262,15 +281,31 @@ namespace AgenteBiometricoPresencial.Server
         {
             Console.WriteLine("\n[Drivers] Inicializando controladores de hardware...");
 
-            if (_realScan.Initialize(out string rsMsg))
-                Console.WriteLine($"  ✓ RealScan G10: {rsMsg}");
-            else
-                Console.WriteLine($"  ✗ RealScan G10: {rsMsg}");
+            try
+            {
+                if (_realScan.Initialize(out string rsMsg))
+                    Console.WriteLine($"  ✓ RealScan G10: {rsMsg}");
+                else
+                    Console.WriteLine($"  ✗ RealScan G10: {rsMsg}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  ✗ RealScan G10: Excepción al inicializar — {ex.GetType().Name}: {ex.Message}");
+                Console.WriteLine("     El agente continúa sin acceso al RealScan G10.");
+            }
 
-            if (_realPass.Initialize(out string rpMsg))
-                Console.WriteLine($"  ✓ RealPass RPNF: {rpMsg}");
-            else
-                Console.WriteLine($"  ✗ RealPass RPNF: {rpMsg}");
+            try
+            {
+                if (_realPass.Initialize(out string rpMsg))
+                    Console.WriteLine($"  ✓ RealPass RPNF: {rpMsg}");
+                else
+                    Console.WriteLine($"  ✗ RealPass RPNF: {rpMsg}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  ✗ RealPass RPNF: Excepción al inicializar — {ex.GetType().Name}: {ex.Message}");
+                Console.WriteLine("     El agente continúa sin acceso al RealPass RPNF.");
+            }
 
             Console.WriteLine();
         }

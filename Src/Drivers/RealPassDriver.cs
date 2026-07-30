@@ -95,8 +95,8 @@ namespace AgenteBiometricoPresencial.Drivers
                 _sdk = Activator.CreateInstance(sdkType);
 
                 // Intentar abrir conexión con el dispositivo
-                // La API real usa: m_RP.Open() → retorna int (0 = OK)
-                int ret = (int)sdkType.GetMethod("Open")!.Invoke(_sdk, null)!;
+                // La API usa Connect(int nReserved)
+                int ret = (int)sdkType.GetMethod("Connect")!.Invoke(_sdk, new object[] { 0 })!;
                 if (ret == 0)
                 {
                     // Obtener versión de firmware si el método existe
@@ -104,9 +104,13 @@ namespace AgenteBiometricoPresencial.Drivers
                     if (fwMethod != null)
                         status.FirmwareVersion = fwMethod.Invoke(_sdk, null)?.ToString();
 
-                    var snMethod = sdkType.GetMethod("GetSerialNumber");
+                    var snMethod = sdkType.GetMethod("GetDeviceSN");
                     if (snMethod != null)
-                        status.SerialNumber = snMethod.Invoke(_sdk, null)?.ToString();
+                    {
+                        object[] args = new object[] { null };
+                        snMethod.Invoke(_sdk, args);
+                        status.SerialNumber = args[0]?.ToString();
+                    }
 
                     _isInitialized = true;
                     status.IsConnected = true;
@@ -117,7 +121,7 @@ namespace AgenteBiometricoPresencial.Drivers
                 else
                 {
                     // Cerrar handle si falla
-                    sdkType.GetMethod("Close")?.Invoke(_sdk, null);
+                    sdkType.GetMethod("Disconnect")?.Invoke(_sdk, null);
                     status.IsConnected = false;
                     status.StatusCode = "DISCONNECTED";
                     status.StatusMessage = $"RealPass RPNF no respondió al abrir la conexión. Código: {ret}. Verifique la conexión USB.";
