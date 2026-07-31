@@ -1,116 +1,65 @@
 using System;
 using System.IO;
 using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Drawing;
+using System.Drawing.Imaging;
 using AgenteBiometricoPresencial.Models;
+using Xperix;
 
 namespace AgenteBiometricoPresencial.Drivers
 {
-    /// <summary>
-    /// Wrapper para el SDK Managed de Xperix RealPass RPNF.
-    /// Namespace: Xperix.RealPassSDK  (Xperix.RealPassSDK.dll)
-    /// Referencia de integración: RealPass_Windows_Webagent_v1.1.pdf
-    ///
-    /// POLÍTICA DE SIMULACIÓN:
-    ///   - Solo se activa si SimulationMode = true (flag --simulate en CLI).
-    ///   - Sin ese flag, si el SDK no está o el dispositivo no responde,
-    ///     se reporta el estado real: DRIVER_MISSING / DISCONNECTED / ERROR.
-    /// </summary>
     public class RealPassDriver
     {
-        private const string DLL_MANAGED = @"C:\Program Files\Xperix\RealPassSDK\Bin\x64\Xperix.RealPassSDK.dll";
-        private const string DLL_NATIVE  = @"C:\Program Files\Xperix\RealPassSDK\Bin\x64\RealPassSDK.dll";
-
-        // Referencia dinámica al tipo RealPassSDK en tiempo de ejecución
-        // (el assembly se carga opcionalmente para no romper compilación sin el SDK instalado)
-        private dynamic? _sdk = null;
+        private RealPassSDK _sdk = null;
         private bool _isInitialized = false;
         private bool _isBusy = false;
 
-        /// <summary>Modo simulación: activar ÚNICAMENTE con --simulate en la CLI.</summary>
-        public bool SimulationMode { get; set; } = false;
+        public bool SimulationMode { get; set; }
 
-        // ─── API Pública ───────────────────────────────────────────────────────
+        private TaskCompletionSource<DocumentScanResult> _tcs;
+        private string _currentSpectralMode = "VIS";
 
-        /// <summary>
-        /// Sondea el estado del RealPass RPNF sin lanzar excepciones.
-        /// </summary>
         public DeviceStatus ProbeDevice()
         {
             var status = new DeviceStatus
             {
                 DeviceName = "Xperix RealPass RPNF",
                 DeviceId = "REALPASS_RPNF",
-                DriverPath = DLL_MANAGED,
+                DriverPath = "Xperix.RealPassSDK.dll",
                 LastCheckedAt = DateTime.UtcNow
             };
 
-            // 1) Modo simulación explícito
             if (SimulationMode)
             {
                 status.IsConnected = true;
                 status.IsSimulated = true;
                 status.DriverFound = true;
                 status.StatusCode = "SIMULATED";
-                status.StatusMessage = "Modo simulación activo (--simulate). No hay hardware real.";
+                status.StatusMessage = "Modo simulación activo.";
                 status.FirmwareVersion = "SIM-3.2";
                 status.SerialNumber = "SIM-RP-0001";
                 return status;
             }
 
-            // 2) Verificar DLL managed en disco
-            if (!File.Exists(DLL_MANAGED))
-            {
-                status.DriverFound = false;
-                status.IsConnected = false;
-                status.StatusCode = "DRIVER_MISSING";
-                status.StatusMessage = $"SDK no instalado. No se encontró: {DLL_MANAGED}";
-                return status;
-            }
-
-            // 3) También verificar la DLL nativa de soporte
-            if (!File.Exists(DLL_NATIVE))
-            {
-                status.DriverFound = false;
-                status.IsConnected = false;
-                status.StatusCode = "DRIVER_MISSING";
-                status.StatusMessage = $"Falta DLL nativa de soporte: {DLL_NATIVE}";
-                return status;
-            }
-
             status.DriverFound = true;
 
-            // 4) Intentar carga dinámica y sondeo del dispositivo
             try
             {
-                var assembly = System.Reflection.Assembly.LoadFrom(DLL_MANAGED);
-                var sdkType = assembly.GetType("Xperix.RealPassSDK");
-                if (sdkType == null)
+                if (_sdk == null)
                 {
-                    status.IsConnected = false;
-                    status.StatusCode = "ERROR";
-                    status.StatusMessage = "No se encontró el tipo Xperix.RealPassSDK en el assembly.";
-                    return status;
+                    _sdk = new RealPassSDK();
+                    _sdk.Create(EventCallback, DataCallback);
                 }
 
-                _sdk = Activator.CreateInstance(sdkType);
-
-                // Intentar abrir conexión con el dispositivo
-                // La API usa Connect(int nReserved)
-                int ret = (int)sdkType.GetMethod("Connect")!.Invoke(_sdk, new object[] { 0 })!;
-                if (ret == 0)
+                int ret = _sdk.Connect(0);
+                if (ret == 0) // RP_SUCCESS
                 {
-                    // Obtener versión de firmware si el método existe
-                    var fwMethod = sdkType.GetMethod("GetFirmwareVersion");
-                    if (fwMethod != null)
-                        status.FirmwareVersion = fwMethod.Invoke(_sdk, null)?.ToString();
-
-                    var snMethod = sdkType.GetMethod("GetDeviceSN");
-                    if (snMethod != null)
-                    {
-                        object[] args = new object[] { null };
-                        snMethod.Invoke(_sdk, args);
-                        status.SerialNumber = args[0]?.ToString();
-                    }
+                    string sn = "";
+                    _sdk.GetDeviceSN(ref sn);
+                    status.SerialNumber = sn;
+                    status.FirmwareVersion = "N/A";
 
                     _isInitialized = true;
                     status.IsConnected = true;
@@ -120,26 +69,23 @@ namespace AgenteBiometricoPresencial.Drivers
                 }
                 else
                 {
-                    // Cerrar handle si falla
-                    sdkType.GetMethod("Disconnect")?.Invoke(_sdk, null);
+                    _sdk.Disconnect();
                     status.IsConnected = false;
                     status.StatusCode = "DISCONNECTED";
-                    status.StatusMessage = $"RealPass RPNF no respondió al abrir la conexión. Código: {ret}. Verifique la conexión USB.";
+                    status.StatusMessage = string.Format("RealPass RPNF no respondió. Código: {0}.", ret);
                 }
             }
             catch (Exception ex)
             {
                 status.IsConnected = false;
                 status.StatusCode = "ERROR";
-                status.StatusMessage = $"Excepción al cargar RealPass SDK: {ex.InnerException?.Message ?? ex.Message}";
+                string innerMsg = ex.InnerException != null ? ex.InnerException.Message : ex.Message;
+                status.StatusMessage = string.Format("Excepción al cargar RealPass SDK: {0}", innerMsg);
             }
 
             return status;
         }
 
-        /// <summary>
-        /// Inicializa el SDK para uso en capturas sucesivas.
-        /// </summary>
         public bool Initialize(out string message)
         {
             if (SimulationMode)
@@ -152,26 +98,16 @@ namespace AgenteBiometricoPresencial.Drivers
             try
             {
                 var status = ProbeDevice();
-                if (!status.IsConnected)
-                {
-                    message = status.StatusMessage;
-                    return false;
-                }
                 message = status.StatusMessage;
-                return true;
+                return status.IsConnected;
             }
             catch (Exception ex)
             {
-                message = $"Error inicializando RealPass: {ex.Message}";
+                message = string.Format("Error inicializando RealPass: {0}", ex.Message);
                 return false;
             }
         }
 
-        /// <summary>
-        /// Inicia un escaneo de documento de identidad.
-        /// spectralMode: "VIS" (luz blanca) | "IR" (infrarrojo) | "UV" (ultravioleta)
-        /// readRfid: leer chip RFID/NFC del pasaporte
-        /// </summary>
         public DocumentScanResult ScanDocument(string spectralMode = "VIS", bool readRfid = true, int timeoutSeconds = 30)
         {
             if (SimulationMode)
@@ -183,52 +119,22 @@ namespace AgenteBiometricoPresencial.Drivers
             if (_isBusy)
                 return new DocumentScanResult { Success = false, ErrorCode = "DEVICE_BUSY", ErrorMessage = "El dispositivo ya está escaneando." };
 
+            _isBusy = true;
+            _currentSpectralMode = spectralMode;
+            _tcs = new TaskCompletionSource<DocumentScanResult>();
+
             try
             {
-                _isBusy = true;
-                var sdkType = _sdk!.GetType();
+                // Start document detection which fires DOC_DETECT_ON event
+                _sdk.StartDocDetect();
 
-                // Capturar imagen (API: Capture(int mode, int timeout))
-                // mode: 0=VIS, 1=IR, 2=UV
-                int mode = spectralMode switch { "IR" => 1, "UV" => 2, _ => 0 };
-                int ret = (int)sdkType.GetMethod("Capture")!.Invoke(_sdk, new object[] { mode, timeoutSeconds * 1000 })!;
-
-                if (ret != 0)
-                    return new DocumentScanResult { Success = false, ErrorCode = $"CAPTURE_ERR_{ret}", ErrorMessage = $"Captura fallida. Código: {ret}" };
-
-                // Obtener imagen como bytes
-                byte[] imgBytes = (byte[])sdkType.GetMethod("GetImage")!.Invoke(_sdk, null)!;
-                string imgBase64 = Convert.ToBase64String(imgBytes);
-
-                // Obtener texto MRZ
-                string mrzRaw = sdkType.GetMethod("GetMRZText")!.Invoke(_sdk, null)?.ToString() ?? "";
-                var mrz = ParseMrz(mrzRaw);
-
-                // Leer chip RFID si se solicita y el documento lo tiene
-                bool rfidRead = false;
-                if (readRfid)
+                if (!_tcs.Task.Wait(timeoutSeconds * 1000))
                 {
-                    var rfidMethod = sdkType.GetMethod("ReadRFID");
-                    if (rfidMethod != null)
-                    {
-                        int rfidRet = (int)rfidMethod.Invoke(_sdk, null)!;
-                        rfidRead = rfidRet == 0;
-                    }
+                    _sdk.StopDocDetect();
+                    return new DocumentScanResult { Success = false, ErrorCode = "TIMEOUT", ErrorMessage = "Tiempo agotado esperando documento." };
                 }
 
-                if (mrz != null) mrz.rfidRead = rfidRead;
-
-                return new DocumentScanResult
-                {
-                    Success = true,
-                    Mrz = mrz,
-                    Images = new DocumentImages
-                    {
-                        whiteLightBase64 = spectralMode == "VIS" ? imgBase64 : null,
-                        infraredBase64   = spectralMode == "IR"  ? imgBase64 : null,
-                        ultravioletBase64 = spectralMode == "UV" ? imgBase64 : null
-                    }
-                };
+                return _tcs.Task.Result;
             }
             catch (Exception ex)
             {
@@ -236,91 +142,257 @@ namespace AgenteBiometricoPresencial.Drivers
             }
             finally
             {
+                _sdk.StopDocDetect();
                 _isBusy = false;
+                _tcs = null;
             }
+        }
+
+        private void EventCallback(RealPassSDK.EventType eventType)
+        {
+            if (eventType == RealPassSDK.EventType.DOC_DETECT_ON)
+            {
+                if (_sdk != null && _isBusy)
+                {
+                    _sdk.ReadDocument();
+                }
+            }
+            else if (eventType == RealPassSDK.EventType.DOCUMENT_READING_COMPLETE)
+            {
+                if (_sdk != null && _tcs != null && !_tcs.Task.IsCompleted)
+                {
+                    try
+                    {
+                        // ─── MRZ ────────────────────────────────────────────────
+                        object mrzData = null;
+                        _sdk.GetData(RealPassSDK.DataType.TEXT_MRZ, ref mrzData);
+                        string mrzRaw = mrzData as string ?? "";
+                        var mrz = ParseMrz(mrzRaw);
+
+                        // ─── QR Code (INE URL) ───────────────────────────────────
+                        string qrData = null;
+                        /*
+                        try
+                        {
+                            object qrObj = null;
+                            _sdk.GetData(RealPassSDK.DataType.TEXT_QR, ref qrObj);
+                            qrData = qrObj as string;
+                        }
+                        catch { }
+                        */
+
+                        // ─── Barcode (PDF417) ────────────────────────────────────
+                        string barcodeData = null;
+                        /*
+                        try
+                        {
+                            object bcObj = null;
+                            _sdk.GetData(RealPassSDK.DataType.TEXT_BARCODE, ref bcObj);
+                            barcodeData = bcObj as string;
+                        }
+                        catch { }
+                        */
+
+                        // ─── Imágenes espectrales (WH + IR + UV) ────────────────
+                        string whBase64 = ExtractImageBase64(RealPassSDK.DataType.IMAGE_WH);
+                        string irBase64 = ExtractImageBase64(RealPassSDK.DataType.IMAGE_IR);
+                        string uvBase64 = ExtractImageBase64(RealPassSDK.DataType.IMAGE_UV);
+
+                        var result = new DocumentScanResult
+                        {
+                            Success     = true,
+                            Mrz         = mrz,
+                            QrData      = qrData,
+                            BarcodeData = barcodeData,
+                            Images      = new DocumentImages
+                            {
+                                whiteLightBase64  = whBase64,
+                                infraredBase64    = irBase64,
+                                ultravioletBase64 = uvBase64
+                            }
+                        };
+
+                        _tcs.TrySetResult(result);
+                    }
+                    catch (Exception ex)
+                    {
+                        _tcs.TrySetResult(new DocumentScanResult { Success = false, ErrorCode = "EXCEPTION", ErrorMessage = ex.Message });
+                    }
+                }
+            }
+        }
+
+        private string ExtractImageBase64(RealPassSDK.DataType dataType)
+        {
+            try
+            {
+                object imgObj = null;
+                _sdk.GetData(dataType, ref imgObj);
+                Bitmap bmp = imgObj as Bitmap;
+                if (bmp == null) return null;
+                using (MemoryStream ms = new MemoryStream())
+                {
+                    bmp.Save(ms, ImageFormat.Jpeg);
+                    return Convert.ToBase64String(ms.ToArray());
+                }
+            }
+            catch { return null; }
+        }
+
+        private void DataCallback(RealPassSDK.DataType dataType, object data)
+        {
+            // Ignored, we pull data on DOCUMENT_READING_COMPLETE
         }
 
         public void Shutdown()
         {
             if (_sdk != null && _isInitialized)
             {
-                try { _sdk.GetType().GetMethod("Close")?.Invoke(_sdk, null); } catch { }
+                try { _sdk.Disconnect(); } catch { }
             }
             _isInitialized = false;
             _sdk = null;
         }
 
-        public bool IsConnected => _isInitialized;
-
-        // ─── Helpers internos ──────────────────────────────────────────────────
-
-        /// <summary>
-        /// Parsea texto MRZ de 2 líneas ICAO 9303 (pasaporte mexicano).
-        /// Línea 1 (44 chars): tipo doc + país + apellido + nombres
-        /// Línea 2 (44 chars): núm doc + país + fecha nac + sexo + fecha exp + número personal
-        /// </summary>
-        private static MrzData? ParseMrz(string mrzRaw)
+        public bool IsConnected
         {
-            if (string.IsNullOrWhiteSpace(mrzRaw)) return null;
+            get { return _isInitialized; }
+        }
+
+        private static MrzData ParseMrz(string mrzRaw)
+        {
+            if (string.IsNullOrEmpty(mrzRaw) || string.IsNullOrEmpty(mrzRaw.Trim())) return null;
 
             var lines = mrzRaw.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
-            if (lines.Length < 2) return null;
+            if (lines.Length == 0) return null;
 
             try
             {
-                string l1 = lines[0].PadRight(44);
-                string l2 = lines[1].PadRight(44);
-
-                string docType = l1[0..2].Trim('<');
-                string country = l1[2..5];
-                string names   = l1[5..44];
-                var nameParts  = names.Split(new[] { "<<" }, StringSplitOptions.None);
-                string surname     = nameParts.Length > 0 ? nameParts[0].Replace("<", " ").Trim() : "";
-                string givenNames  = nameParts.Length > 1 ? nameParts[1].Replace("<", " ").Trim() : "";
-
-                string docNumber  = l2[0..9].Replace("<", "");
-                string dob        = l2[13..19];
-                string sex        = l2[20..21];
-                string expiry     = l2[21..27];
-                string personal   = l2[28..42].Replace("<", "");
-
-                // En México el campo personal (28-42) contiene la CURP
-                string curp = personal.Length >= 18 ? personal[..18] : personal;
-
-                bool isExpired = false;
-                if (expiry.Length == 6 && int.TryParse(expiry, out _))
+                // CASO 1: TD1 (INE / Identificaciones de 3 líneas, ~30 caracteres/línea)
+                if (lines.Length >= 3)
                 {
-                    int yy = int.Parse(expiry[..2]);
-                    int mm = int.Parse(expiry[2..4]);
-                    int dd = int.Parse(expiry[4..6]);
-                    int fullYear = yy >= 0 && yy <= DateTime.Now.Year % 100 + 10
-                        ? 2000 + yy : 1900 + yy;
-                    var expiryDate = new DateTime(fullYear, mm, dd);
-                    isExpired = expiryDate < DateTime.Today;
+                    string l1 = lines[0].Trim().PadRight(30);
+                    string l2 = lines[1].Trim().PadRight(30);
+                    string l3 = lines[2].Trim().PadRight(30);
+
+                    string docType = l1.Substring(0, 2).Replace("<", "").Trim();
+                    string country = l1.Substring(2, 3).Trim();
+                    string docNum  = l1.Substring(5, 9).Replace("<", "").Trim();
+
+                    string dob     = l2.Length >= 6 ? l2.Substring(0, 6) : "";
+                    string sex     = l2.Length >= 8 ? l2.Substring(7, 1) : "";
+                    string expiry  = l2.Length >= 14 ? l2.Substring(8, 6) : "";
+
+                    // Nombres en línea 3: APELLIDOS<<NOMBRES
+                    string nameStr = l3.Trim();
+                    var nameParts  = nameStr.Split(new[] { "<<" }, StringSplitOptions.None);
+                    string surname    = nameParts.Length > 0 ? nameParts[0].Replace("<", " ").Trim() : "";
+                    string givenNames = nameParts.Length > 1 ? nameParts[1].Replace("<", " ").Trim() : "";
+
+                    // Buscar CURP con Expresión Regular en cualquiera de las líneas
+                    string curp = "";
+                    foreach (var l in lines)
+                    {
+                        var clean = l.Replace("<", " ");
+                        var match = System.Text.RegularExpressions.Regex.Match(clean, @"[A-Z]{4}\d{6}[HM][A-Z]{5}[A-Z0-9]\d");
+                        if (match.Success)
+                        {
+                            curp = match.Value;
+                            break;
+                        }
+                    }
+
+                    bool isExpired = false;
+                    int tempVal;
+                    if (expiry.Length == 6 && int.TryParse(expiry, out tempVal))
+                    {
+                        int yy = int.Parse(expiry.Substring(0, 2));
+                        int mm = int.Parse(expiry.Substring(2, 2));
+                        int dd = int.Parse(expiry.Substring(4, 2));
+                        int fullYear = (yy >= 0 && yy <= DateTime.Now.Year % 100 + 10) ? 2000 + yy : 1900 + yy;
+                        if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31)
+                        {
+                            var expiryDate = new DateTime(fullYear, mm, dd);
+                            isExpired = expiryDate < DateTime.Today;
+                        }
+                    }
+
+                    return new MrzData
+                    {
+                        documentType   = string.IsNullOrEmpty(docType) ? "I" : docType,
+                        country        = country,
+                        surname        = surname,
+                        givenNames     = givenNames,
+                        documentNumber = docNum,
+                        curp           = curp,
+                        dateOfBirth    = dob,
+                        sex            = sex,
+                        expiryDate     = expiry,
+                        isExpired      = isExpired
+                    };
                 }
 
-                return new MrzData
+                // CASO 2: TD3 (Pasaportes de 2 líneas, 44 caracteres/línea)
+                if (lines.Length >= 2)
                 {
-                    documentType   = docType,
-                    country        = country,
-                    surname        = surname,
-                    givenNames     = givenNames,
-                    documentNumber = docNumber,
-                    curp           = curp,
-                    dateOfBirth    = dob,
-                    sex            = sex,
-                    expiryDate     = expiry,
-                    isExpired      = isExpired
-                };
+                    string l1 = lines[0].Trim().PadRight(44);
+                    string l2 = lines[1].Trim().PadRight(44);
+
+                    string docType = l1.Substring(0, 2).Replace("<", "").Trim();
+                    string country = l1.Substring(2, 3).Trim();
+                    string names   = l1.Substring(5, 39);
+                    var nameParts  = names.Split(new[] { "<<" }, StringSplitOptions.None);
+                    string surname     = nameParts.Length > 0 ? nameParts[0].Replace("<", " ").Trim() : "";
+                    string givenNames  = nameParts.Length > 1 ? nameParts[1].Replace("<", " ").Trim() : "";
+
+                    string docNumber  = l2.Substring(0, 9).Replace("<", "").Trim();
+                    string dob        = l2.Substring(13, 6);
+                    string sex        = l2.Substring(20, 1);
+                    string expiry     = l2.Substring(21, 6);
+                    string personal   = l2.Substring(28, 14).Replace("<", "").Trim();
+
+                    string curp = personal.Length >= 18 ? personal.Substring(0, 18) : personal;
+
+                    bool isExpired = false;
+                    int tempVal;
+                    if (expiry.Length == 6 && int.TryParse(expiry, out tempVal))
+                    {
+                        int yy = int.Parse(expiry.Substring(0, 2));
+                        int mm = int.Parse(expiry.Substring(2, 2));
+                        int dd = int.Parse(expiry.Substring(4, 2));
+                        int fullYear = (yy >= 0 && yy <= DateTime.Now.Year % 100 + 10) ? 2000 + yy : 1900 + yy;
+                        if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31)
+                        {
+                            var expiryDate = new DateTime(fullYear, mm, dd);
+                            isExpired = expiryDate < DateTime.Today;
+                        }
+                    }
+
+                    return new MrzData
+                    {
+                        documentType   = docType,
+                        country        = country,
+                        surname        = surname,
+                        givenNames     = givenNames,
+                        documentNumber = docNumber,
+                        curp           = curp,
+                        dateOfBirth    = dob,
+                        sex            = sex,
+                        expiryDate     = expiry,
+                        isExpired      = isExpired
+                    };
+                }
             }
-            catch
+            catch (Exception ex)
             {
-                return null;
+                Console.WriteLine("[RealPass] Error parseando MRZ: " + ex.Message);
             }
+            return null;
         }
 
-        private static DocumentScanResult BuildSimulatedDocument() =>
-            new()
+        private static DocumentScanResult BuildSimulatedDocument()
+        {
+            return new DocumentScanResult
             {
                 Success = true,
                 IsSimulated = true,
@@ -345,15 +417,20 @@ namespace AgenteBiometricoPresencial.Drivers
                     ultravioletBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwADhQGAWjR9awAAAABJRU5ErkJggg=="
                 }
             };
+        }
     }
 
     public class DocumentScanResult
     {
-        public bool Success { get; set; }
-        public bool IsSimulated { get; set; }
-        public MrzData? Mrz { get; set; }
-        public DocumentImages? Images { get; set; }
-        public string? ErrorCode { get; set; }
-        public string? ErrorMessage { get; set; }
+        public bool           Success     { get; set; }
+        public bool           IsSimulated { get; set; }
+        public MrzData        Mrz         { get; set; }
+        public DocumentImages Images      { get; set; }
+        /// <summary>URL del código QR del INE (ej: http://qr.ine.mx/...)</summary>
+        public string         QrData      { get; set; }
+        /// <summary>Datos del código de barras PDF417 si aplica</summary>
+        public string         BarcodeData { get; set; }
+        public string         ErrorCode   { get; set; }
+        public string         ErrorMessage { get; set; }
     }
 }
