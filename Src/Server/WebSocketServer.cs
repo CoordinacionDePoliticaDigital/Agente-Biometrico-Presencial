@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using Fleck;
 using Newtonsoft.Json;
@@ -19,27 +22,20 @@ namespace AgenteBiometricoPresencial.Server
     /// </summary>
     public class BiometricWebSocketServer
     {
-        private const string AGENT_VERSION = "2.0.0";
+        private const string AGENT_VERSION = "3.0.0";
         private const int HEARTBEAT_INTERVAL_SEC = 5;
 
-        // Directorio de DLLs del RealScan SDK (necesario para opencv, tensorflow, etc.)
         private const string REALSCAN_DLL_DIR = @"C:\Program Files\Xperix\RealScanSDK\Bin\x64";
+        private const string REALPASS_DLL_DIR = @"C:\Program Files\Xperix\RealPassSDK\Bin\x64";
 
-        // P/Invoke para agregar el directorio del SDK al search path de DLLs nativas
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern bool SetDllDirectory(string lpPathName);
+        private WebSocketServer _server;
+        private readonly ConcurrentDictionary<Guid, IWebSocketConnection> _clients = new ConcurrentDictionary<Guid, IWebSocketConnection>();
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        private static extern bool AddDllDirectory(string lpPathName);
+        private readonly RealScanDriver _realScan = new RealScanDriver();
+        private readonly RealPassDriver _realPass = new RealPassDriver();
+        private DeviceStatusMonitor _monitor;
 
-        private WebSocketServer? _server;
-        private readonly ConcurrentDictionary<Guid, IWebSocketConnection> _clients = new();
-
-        private readonly RealScanDriver _realScan = new();
-        private readonly RealPassDriver _realPass = new();
-        private DeviceStatusMonitor? _monitor;
-
-        private Timer? _heartbeatTimer;
+        private System.Threading.Timer _heartbeatTimer;
 
         // ─── Arranque ──────────────────────────────────────────────────────────
 
@@ -52,52 +48,44 @@ namespace AgenteBiometricoPresencial.Server
             if (simulationMode)
                 Console.WriteLine("\n  ⚠  MODO SIMULACIÓN ACTIVO — No se usará hardware real\n");
 
-            // Agregar el directorio de DLLs del SDK al search path ANTES de cargar el driver
-            if (System.IO.Directory.Exists(REALSCAN_DLL_DIR))
-            {
-                SetDllDirectory(REALSCAN_DLL_DIR);
-                Console.WriteLine($"[INFO] DLL search path → {REALSCAN_DLL_DIR}");
-            }
-
-            // Configurar y arrancar el monitor de periféricos (usa ProbeDevice, no Initialize)
+            // Configurar y arrancar el monitor de periféricos
             _monitor = new DeviceStatusMonitor(_realScan, _realPass);
             _monitor.OnStatusChanged += BroadcastDeviceStatusUpdate;
             _monitor.Start();
 
             // Configurar servidor Fleck
             FleckLog.Level = LogLevel.Warn;
-            _server = new WebSocketServer($"ws://0.0.0.0:{port}");
+            _server = new WebSocketServer(string.Format("ws://0.0.0.0:{0}", port));
 
             _server.Start(socket =>
             {
                 socket.OnOpen = () => OnClientConnected(socket);
                 socket.OnClose = () => OnClientDisconnected(socket);
                 socket.OnMessage = message => ProcessMessage(socket, message);
-                socket.OnError = ex => Console.WriteLine($"[WS ERROR] {socket.ConnectionInfo.Id}: {ex.Message}");
+                socket.OnError = ex => Console.WriteLine(string.Format("[WS ERROR] {0}: {1}", socket.ConnectionInfo.Id, ex.Message));
             });
 
             // Heartbeat periódico
-            _heartbeatTimer = new Timer(
+            _heartbeatTimer = new System.Threading.Timer(
                 _ => BroadcastHeartbeat(),
                 null,
                 TimeSpan.FromSeconds(HEARTBEAT_INTERVAL_SEC),
                 TimeSpan.FromSeconds(HEARTBEAT_INTERVAL_SEC)
             );
 
-            Console.WriteLine($"[INFO] WebSocket escuchando en ws://127.0.0.1:{port}");
+            Console.WriteLine(string.Format("[INFO] WebSocket escuchando en ws://127.0.0.1:{0}", port));
 
-            // Inicializar drivers DESPUÉS de que el WebSocket ya esté escuchando
-            // Así un fallo del SDK no impide que el agente arranque
+            // Inicializar drivers
             InitializeDrivers();
         }
 
         public void Stop()
         {
-            _heartbeatTimer?.Dispose();
-            _monitor?.Stop();
+            if (_heartbeatTimer != null) _heartbeatTimer.Dispose();
+            if (_monitor != null) _monitor.Stop();
             _realScan.Shutdown();
             _realPass.Shutdown();
-            _server?.Dispose();
+            if (_server != null) _server.Dispose();
             Console.WriteLine("[INFO] Agente biométrico detenido.");
         }
 
@@ -106,9 +94,11 @@ namespace AgenteBiometricoPresencial.Server
         private void OnClientConnected(IWebSocketConnection socket)
         {
             _clients[socket.ConnectionInfo.Id] = socket;
-            Console.WriteLine($"[WS ↑] Cliente conectado: {socket.ConnectionInfo.ClientIpAddress} (ID: {socket.ConnectionInfo.Id})");
+            Console.WriteLine(string.Format("[WS ↑] Cliente conectado: {0} (ID: {1})", socket.ConnectionInfo.ClientIpAddress, socket.ConnectionInfo.Id));
 
-            var (rs, rp) = _monitor!.GetCurrentStatus();
+            var statusTuple = _monitor.GetCurrentStatus();
+            var rs = statusTuple.Item1;
+            var rp = statusTuple.Item2;
 
             var handshake = new ConnectedHandshakeMsg
             {
@@ -122,21 +112,25 @@ namespace AgenteBiometricoPresencial.Server
 
         private void OnClientDisconnected(IWebSocketConnection socket)
         {
-            _clients.TryRemove(socket.ConnectionInfo.Id, out _);
-            Console.WriteLine($"[WS ↓] Cliente desconectado: {socket.ConnectionInfo.Id}");
+            IWebSocketConnection removed;
+            _clients.TryRemove(socket.ConnectionInfo.Id, out removed);
+            Console.WriteLine(string.Format("[WS ↓] Cliente desconectado: {0}", socket.ConnectionInfo.Id));
         }
 
         // ─── Procesamiento de Comandos ─────────────────────────────────────────
 
         private void ProcessMessage(IWebSocketConnection socket, string rawJson)
         {
-            Console.WriteLine($"[→ CMD] {rawJson}");
+            Console.WriteLine(string.Format("[→ CMD] {0}", rawJson));
             try
             {
-                var cmd = JsonConvert.DeserializeObject<IncomingCommand>(rawJson)
-                    ?? throw new InvalidOperationException("JSON inválido.");
+                var cmd = JsonConvert.DeserializeObject<IncomingCommand>(rawJson);
+                if (cmd == null)
+                    throw new InvalidOperationException("JSON inválido.");
 
-                string sessionId = cmd.sessionId ?? Guid.NewGuid().ToString("N")[..8].ToUpper();
+                string sessionId = cmd.sessionId;
+                if (string.IsNullOrEmpty(sessionId))
+                    sessionId = Guid.NewGuid().ToString("N").Substring(0, 8).ToUpper();
 
                 switch (cmd.command)
                 {
@@ -152,18 +146,22 @@ namespace AgenteBiometricoPresencial.Server
                         HandleDocumentScan(socket, cmd, sessionId);
                         break;
 
+                    case "START_FULL_BIOMETRIC_CAPTURE":
+                        HandleFullBiometricCapture(socket, cmd, sessionId);
+                        break;
+
                     case "ABORT_CAPTURE":
                         HandleAbortCapture(socket, sessionId);
                         break;
 
                     default:
-                        SafeSend(socket, Error(sessionId, "UNKNOWN_COMMAND", $"Comando no reconocido: '{cmd.command}'"));
+                        SafeSend(socket, Error(sessionId, "UNKNOWN_COMMAND", string.Format("Comando no reconocido: '{0}'", cmd.command)));
                         break;
                 }
             }
             catch (Exception ex)
             {
-                SafeSend(socket, Error("", "PARSE_ERROR", $"Error procesando mensaje: {ex.Message}"));
+                SafeSend(socket, Error("", "PARSE_ERROR", string.Format("Error procesando mensaje: {0}", ex.Message)));
             }
         }
 
@@ -171,19 +169,18 @@ namespace AgenteBiometricoPresencial.Server
 
         private void HandleGetDeviceStatus(IWebSocketConnection socket, string sessionId)
         {
-            var (rs, rp) = _monitor!.GetCurrentStatus();
-            var msg = new DeviceStatusUpdateMsg { devices = BuildDevicePayload(rs, rp) };
+            var statusTuple = _monitor.GetCurrentStatus();
+            var msg = new DeviceStatusUpdateMsg { devices = BuildDevicePayload(statusTuple.Item1, statusTuple.Item2) };
             SafeSend(socket, JsonConvert.SerializeObject(msg));
         }
 
         private void HandleFingerprintCapture(IWebSocketConnection socket, IncomingCommand cmd, string sessionId)
         {
-            string fingerGroup = cmd.fingerGroup ?? "SLAP_4_LEFT";
-            var skipFingers = cmd.skipFingers ?? new List<int>();
+            string fingerGroup = cmd.fingerGroup != null ? cmd.fingerGroup : "SLAP_4_LEFT";
+            var skipFingers = cmd.skipFingers != null ? cmd.skipFingers : new List<int>();
 
-            Console.WriteLine($"[→ HUELLA] Grupo: {fingerGroup} | Omitir dedos: [{string.Join(",", skipFingers)}]");
+            Console.WriteLine(string.Format("[→ HUELLA] Grupo: {0} | Omitir dedos: [{1}]", fingerGroup, string.Join(",", skipFingers)));
 
-            // Ejecutar en hilo separado para no bloquear el WebSocket
             ThreadPool.QueueUserWorkItem(_ =>
             {
                 var result = _realScan.CaptureSlap(fingerGroup, skipFingers, cmd.timeoutSeconds);
@@ -209,15 +206,15 @@ namespace AgenteBiometricoPresencial.Server
                 }
                 else
                 {
-                    SafeSend(socket, Error(sessionId, result.ErrorCode ?? "CAPTURE_FAILED", result.ErrorMessage ?? "Captura fallida."));
+                    SafeSend(socket, Error(sessionId, result.ErrorCode != null ? result.ErrorCode : "CAPTURE_FAILED", result.ErrorMessage != null ? result.ErrorMessage : "Captura fallida."));
                 }
             });
         }
 
         private void HandleDocumentScan(IWebSocketConnection socket, IncomingCommand cmd, string sessionId)
         {
-            string spectralMode = cmd.spectralMode ?? "VIS";
-            Console.WriteLine($"[→ DOC] Modo espectral: {spectralMode} | RFID: {cmd.readRfid}");
+            string spectralMode = cmd.spectralMode != null ? cmd.spectralMode : "VIS";
+            Console.WriteLine(string.Format("[→ DOC] Modo espectral: {0} | RFID: {1}", spectralMode, cmd.readRfid));
 
             ThreadPool.QueueUserWorkItem(_ =>
             {
@@ -235,35 +232,110 @@ namespace AgenteBiometricoPresencial.Server
                 }
                 else
                 {
-                    SafeSend(socket, Error(sessionId, result.ErrorCode ?? "SCAN_FAILED", result.ErrorMessage ?? "Escaneo fallido."));
+                    SafeSend(socket, Error(sessionId, result.ErrorCode != null ? result.ErrorCode : "SCAN_FAILED", result.ErrorMessage != null ? result.ErrorMessage : "Escaneo fallido."));
                 }
             });
+        }
+
+        private void HandleFullBiometricCapture(IWebSocketConnection socket, IncomingCommand cmd, string sessionId)
+        {
+            Console.WriteLine("[→ NATIVE] Iniciando Captura Completa nativa en Windows Forms.");
+
+            Thread uiThread = new Thread(() =>
+            {
+                try
+                {
+                    System.Windows.Forms.Application.EnableVisualStyles();
+                    System.Windows.Forms.Application.SetCompatibleTextRenderingDefault(false);
+                    var form = new AgenteBiometricoPresencial.UI.CaptureForm(
+                        _realScan, _realPass,
+                        cmd.mobileLivenessUrl != null ? cmd.mobileLivenessUrl : "http://192.168.11.53:3001");
+                    if (form.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+                    {
+                        var payload = new
+                        {
+                            documentFront = form.DocResultFront,
+                            documentBack = form.DocResultBack,
+                            fingerLeft = form.FingerLeft,
+                            fingerRight = form.FingerRight,
+                            fingerThumbs = form.FingerThumbs,
+                            faceImageBase64 = form.FaceImageBase64
+                        };
+                        string jsonPayload = JsonConvert.SerializeObject(payload);
+
+                        string encryptedBase64 = "";
+                        string ivBase64 = "";
+
+                        if (!string.IsNullOrEmpty(cmd.encryptionKeyBase64))
+                        {
+                            using (var aes = Aes.Create())
+                            {
+                                aes.Key = Convert.FromBase64String(cmd.encryptionKeyBase64);
+                                aes.GenerateIV();
+                                ivBase64 = Convert.ToBase64String(aes.IV);
+
+                                var encryptor = aes.CreateEncryptor(aes.Key, aes.IV);
+                                using (var ms = new MemoryStream())
+                                {
+                                    using (var cs = new CryptoStream(ms, encryptor, CryptoStreamMode.Write))
+                                    using (var sw = new StreamWriter(cs))
+                                    {
+                                        sw.Write(jsonPayload);
+                                    }
+                                    encryptedBase64 = Convert.ToBase64String(ms.ToArray());
+                                }
+                            }
+                        }
+                        else
+                        {
+                            encryptedBase64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(jsonPayload));
+                        }
+
+                        var msg = new FullBiometricResultMsg
+                        {
+                            sessionId = sessionId,
+                            encryptedPayloadBase64 = encryptedBase64,
+                            ivBase64 = ivBase64
+                        };
+                        SafeSend(socket, JsonConvert.SerializeObject(msg));
+                    }
+                    else
+                    {
+                        SafeSend(socket, Error(sessionId, "CAPTURE_CANCELLED", "Captura biométrica cancelada por el usuario."));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    SafeSend(socket, Error(sessionId, "UI_ERROR", string.Format("Error en UI nativa: {0}", ex.Message)));
+                }
+            });
+            uiThread.SetApartmentState(ApartmentState.STA);
+            uiThread.Start();
         }
 
         private void HandleAbortCapture(IWebSocketConnection socket, string sessionId)
         {
             _realScan.AbortCapture();
-            SafeSend(socket, JsonConvert.SerializeObject(new { event_type = "CAPTURE_ABORTED", sessionId }));
-            Console.WriteLine($"[ABORT] Sesión {sessionId} — captura abortada por cliente.");
+            SafeSend(socket, JsonConvert.SerializeObject(new { event_type = "CAPTURE_ABORTED", sessionId = sessionId }));
+            Console.WriteLine(string.Format("[ABORT] Sesión {0} — captura abortada por cliente.", sessionId));
         }
 
         // ─── Broadcast ─────────────────────────────────────────────────────────
 
         private void BroadcastDeviceStatusUpdate(DevStatus rs, DevStatus rp)
         {
-            // DeviceStatus del namespace Drivers, solo re-alias para usar los modelos correctos
             var msg = new DeviceStatusUpdateMsg { devices = BuildDevicePayload(rs, rp) };
             BroadcastAll(JsonConvert.SerializeObject(msg));
         }
 
         private void BroadcastHeartbeat()
         {
-            var (rs, rp) = _monitor!.GetCurrentStatus();
+            var statusTuple = _monitor.GetCurrentStatus();
             var msg = new AgentHeartbeatMsg
             {
                 agentVersion   = AGENT_VERSION,
                 simulationMode = _realScan.SimulationMode,
-                devices        = BuildDevicePayload(rs, rp),
+                devices        = BuildDevicePayload(statusTuple.Item1, statusTuple.Item2),
                 timestamp      = DateTime.UtcNow.ToString("o")
             };
             BroadcastAll(JsonConvert.SerializeObject(msg));
@@ -271,8 +343,8 @@ namespace AgenteBiometricoPresencial.Server
 
         private void BroadcastAll(string json)
         {
-            foreach (var (_, socket) in _clients)
-                SafeSend(socket, json);
+            foreach (var kvp in _clients)
+                SafeSend(kvp.Value, json);
         }
 
         // ─── Inicialización de Drivers ─────────────────────────────────────────
@@ -283,27 +355,29 @@ namespace AgenteBiometricoPresencial.Server
 
             try
             {
-                if (_realScan.Initialize(out string rsMsg))
-                    Console.WriteLine($"  ✓ RealScan G10: {rsMsg}");
+                string rsMsg;
+                if (_realScan.Initialize(out rsMsg))
+                    Console.WriteLine(string.Format("  ✓ RealScan G10: {0}", rsMsg));
                 else
-                    Console.WriteLine($"  ✗ RealScan G10: {rsMsg}");
+                    Console.WriteLine(string.Format("  ✗ RealScan G10: {0}", rsMsg));
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"  ✗ RealScan G10: Excepción al inicializar — {ex.GetType().Name}: {ex.Message}");
+                Console.WriteLine(string.Format("  ✗ RealScan G10: Excepción al inicializar — {0}: {1}", ex.GetType().Name, ex.Message));
                 Console.WriteLine("     El agente continúa sin acceso al RealScan G10.");
             }
 
             try
             {
-                if (_realPass.Initialize(out string rpMsg))
-                    Console.WriteLine($"  ✓ RealPass RPNF: {rpMsg}");
+                string rpMsg;
+                if (_realPass.Initialize(out rpMsg))
+                    Console.WriteLine(string.Format("  ✓ RealPass RPNF: {0}", rpMsg));
                 else
-                    Console.WriteLine($"  ✗ RealPass RPNF: {rpMsg}");
+                    Console.WriteLine(string.Format("  ✗ RealPass RPNF: {0}", rpMsg));
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"  ✗ RealPass RPNF: Excepción al inicializar — {ex.GetType().Name}: {ex.Message}");
+                Console.WriteLine(string.Format("  ✗ RealPass RPNF: Excepción al inicializar — {0}: {1}", ex.GetType().Name, ex.Message));
                 Console.WriteLine("     El agente continúa sin acceso al RealPass RPNF.");
             }
 
@@ -312,8 +386,9 @@ namespace AgenteBiometricoPresencial.Server
 
         // ─── Helpers ───────────────────────────────────────────────────────────
 
-        private static DeviceStatusPayload BuildDevicePayload(DevStatus rs, DevStatus rp) =>
-            new()
+        private static DeviceStatusPayload BuildDevicePayload(DevStatus rs, DevStatus rp)
+        {
+            return new DeviceStatusPayload
             {
                 realScanG10 = new DeviceStatusItem
                 {
@@ -340,25 +415,28 @@ namespace AgenteBiometricoPresencial.Server
                     lastCheckedAt  = rp.LastCheckedAt.ToString("o")
                 }
             };
+        }
 
-        private static string Error(string sessionId, string code, string message) =>
-            JsonConvert.SerializeObject(new CaptureErrorMsg
+        private static string Error(string sessionId, string code, string message)
+        {
+            return JsonConvert.SerializeObject(new CaptureErrorMsg
             {
                 sessionId = sessionId,
                 errorCode = code,
                 message   = message
             });
+        }
 
         private static void SafeSend(IWebSocketConnection socket, string json)
         {
             try
             {
-                if (socket.IsAvailable)
+                if (socket != null && socket.IsAvailable)
                     socket.Send(json);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[WS SEND ERROR] {ex.Message}");
+                Console.WriteLine(string.Format("[WS SEND ERROR] {0}", ex.Message));
             }
         }
     }

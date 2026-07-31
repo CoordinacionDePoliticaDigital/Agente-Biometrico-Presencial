@@ -1,5 +1,4 @@
 using System.Collections.Generic;
-using AgenteBiometricoPresencial.Models;
 
 namespace AgenteBiometricoPresencial.Models
 {
@@ -10,22 +9,22 @@ namespace AgenteBiometricoPresencial.Models
     {
         public string event_type { get; set; } = "CONNECTED_HANDSHAKE";
         public string status { get; set; } = "READY";
-        public string agentVersion { get; set; } = "2.0.0";
-        public bool simulationMode { get; set; } = false;
-        public DeviceStatusPayload devices { get; set; } = new();
+        public string agentVersion { get; set; } = "3.0.0";
+        public bool simulationMode { get; set; }
+        public DeviceStatusPayload devices { get; set; } = new DeviceStatusPayload();
     }
 
     /// <summary>Estado actual de todos los periféricos.</summary>
     public class DeviceStatusUpdateMsg
     {
         public string event_type { get; set; } = "DEVICE_STATUS_UPDATE";
-        public DeviceStatusPayload devices { get; set; } = new();
+        public DeviceStatusPayload devices { get; set; } = new DeviceStatusPayload();
     }
 
     public class DeviceStatusPayload
     {
-        public DeviceStatusItem realScanG10 { get; set; } = new();
-        public DeviceStatusItem realPassRPNF { get; set; } = new();
+        public DeviceStatusItem realScanG10 { get; set; } = new DeviceStatusItem();
+        public DeviceStatusItem realPassRPNF { get; set; } = new DeviceStatusItem();
     }
 
     public class DeviceStatusItem
@@ -35,10 +34,10 @@ namespace AgenteBiometricoPresencial.Models
         public bool isBusy { get; set; }
         public string statusCode { get; set; } = "UNKNOWN";
         public string statusMessage { get; set; } = "";
-        public string? firmwareVersion { get; set; }
-        public string? serialNumber { get; set; }
+        public string firmwareVersion { get; set; }
+        public string serialNumber { get; set; }
         public bool driverFound { get; set; }
-        public string? lastCheckedAt { get; set; }
+        public string lastCheckedAt { get; set; }
     }
 
     /// <summary>Huella capturada con éxito.</summary>
@@ -47,7 +46,7 @@ namespace AgenteBiometricoPresencial.Models
         public string event_type { get; set; } = "FINGERPRINT_CAPTURED";
         public string sessionId { get; set; } = "";
         public string status { get; set; } = "SUCCESS";
-        public FingerprintData? data { get; set; }
+        public FingerprintData data { get; set; }
     }
 
     public class FingerprintData
@@ -58,8 +57,8 @@ namespace AgenteBiometricoPresencial.Models
         public string isoTemplateBase64 { get; set; } = "";
         public int imageWidth { get; set; }
         public int imageHeight { get; set; }
-        public List<int> capturedFingers { get; set; } = new(); // IDs de dedos capturados
-        public List<int> skippedFingers { get; set; } = new();  // IDs de dedos omitidos (amputados)
+        public List<int> capturedFingers { get; set; } = new List<int>(); // IDs de dedos capturados
+        public List<int> skippedFingers { get; set; } = new List<int>();  // IDs de dedos omitidos (amputados)
     }
 
     /// <summary>Frame en vivo durante captura dactilar.</summary>
@@ -69,7 +68,7 @@ namespace AgenteBiometricoPresencial.Models
         public string sessionId { get; set; } = "";
         public int qualityScore { get; set; }  // 0–100
         public bool fingerDetected { get; set; }
-        public string? previewBase64 { get; set; }
+        public string previewBase64 { get; set; }
     }
 
     /// <summary>Documento escaneado por RealPass RPNF.</summary>
@@ -78,8 +77,8 @@ namespace AgenteBiometricoPresencial.Models
         public string event_type { get; set; } = "DOCUMENT_SCANNED";
         public string sessionId { get; set; } = "";
         public string status { get; set; } = "SUCCESS";
-        public MrzData? mrz { get; set; }
-        public DocumentImages? images { get; set; }
+        public MrzData mrz { get; set; }
+        public DocumentImages images { get; set; }
     }
 
     public class MrzData
@@ -89,7 +88,7 @@ namespace AgenteBiometricoPresencial.Models
         public string surname { get; set; } = "";
         public string givenNames { get; set; } = "";
         public string documentNumber { get; set; } = "";
-        public string? curp { get; set; }
+        public string curp { get; set; }
         public string dateOfBirth { get; set; } = "";
         public string sex { get; set; } = "";
         public string expiryDate { get; set; } = "";
@@ -99,9 +98,9 @@ namespace AgenteBiometricoPresencial.Models
 
     public class DocumentImages
     {
-        public string? whiteLightBase64 { get; set; }
-        public string? infraredBase64 { get; set; }
-        public string? ultravioletBase64 { get; set; }
+        public string whiteLightBase64 { get; set; }
+        public string infraredBase64 { get; set; }
+        public string ultravioletBase64 { get; set; }
     }
 
     /// <summary>Error en captura o comando no reconocido.</summary>
@@ -117,10 +116,10 @@ namespace AgenteBiometricoPresencial.Models
     public class AgentHeartbeatMsg
     {
         public string event_type { get; set; } = "AGENT_HEARTBEAT";
-        public string agentVersion { get; set; } = "2.0.0";
-        public DeviceStatusPayload devices { get; set; } = new();
+        public string agentVersion { get; set; } = "3.0.0";
+        public DeviceStatusPayload devices { get; set; } = new DeviceStatusPayload();
         public string timestamp { get; set; } = "";
-        public bool simulationMode { get; set; } = false;
+        public bool simulationMode { get; set; }
     }
 
     // ─── MENSAJES FRONTEND → AGENTE ────────────────────────────────────────────
@@ -128,11 +127,26 @@ namespace AgenteBiometricoPresencial.Models
     public class IncomingCommand
     {
         public string command { get; set; } = "";
-        public string? sessionId { get; set; }
-        public string? fingerGroup { get; set; }        // Para START_FINGERPRINT_CAPTURE
-        public List<int>? skipFingers { get; set; }     // Dedos a omitir (amputados)
+        public string sessionId { get; set; }
+        public string fingerGroup { get; set; }        // Para START_FINGERPRINT_CAPTURE
+        public List<int> skipFingers { get; set; }     // Dedos a omitir (amputados)
         public int timeoutSeconds { get; set; } = 30;
         public bool readRfid { get; set; } = true;
-        public string? spectralMode { get; set; }       // VIS | IR | UV
+        public string spectralMode { get; set; }       // VIS | IR | UV
+
+        // Para START_FULL_BIOMETRIC_CAPTURE
+        public string documentType { get; set; } // "PASAPORTE" | "INE"
+        public string encryptionKeyBase64 { get; set; }
+        public string mobileLivenessUrl { get; set; }
+    }
+
+    public class FullBiometricResultMsg
+    {
+        public string event_type { get; set; } = "FULL_BIOMETRIC_CAPTURED";
+        public string sessionId { get; set; } = "";
+        public string status { get; set; } = "SUCCESS";
+        // JSON cifrado con AES (contiene los datos reales)
+        public string encryptedPayloadBase64 { get; set; } = "";
+        public string ivBase64 { get; set; } = "";
     }
 }
