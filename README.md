@@ -47,12 +47,91 @@ Este middleware actúa como puente entre el cliente web Frontend (Svelte en Tier
 
 ---
 
-## 🚀 Compilación y Ejecución
+## Estado de la integración
+
+- **RealScan G10**: captura 4+4+2, segmentación y etiquetado por dedo,
+  dedos faltantes, calidad NFIQ individual, LFD, WSQ de plancha/dedo y
+  plantilla ISO/IEC 19794-2 implementados sobre el binding nativo x64.
+- **RealPass RPNF**: detección y lectura asíncrona, MRZ parseada, códigos de
+  barras, imágenes WH/IR/UV/OCR/retrato y resultados de seguridad ePassport
+  implementados sobre el ensamblado oficial.
+- **Plantilla ISO 19794-2**: se genera por dedo mediante `RS_GetTemplate`. Si el
+  SDK o la licencia instalada no soportan el extractor, la captura falla de
+  forma explícita; no se generan datos ficticios.
+
+## Compilación y ejecución
 
 ```bash
 # Compilar proyecto en modo Release x64
-dotnet build -c Release -r win-x64
+dotnet build Src/AgenteBiometrico.csproj -c Release -r win-x64
 
 # Ejecutar el servicio interactivo
 dotnet run --project Src/AgenteBiometrico.csproj
+
+# Diagnosticar SDK y conexión física sin abrir el WebSocket
+dotnet run --project Src/AgenteBiometrico.csproj -- --diagnose
+
+# Captura física de prueba; sólo imprime métricas, no guarda biométricos
+dotnet run --project Src/AgenteBiometrico.csproj -- --capture SLAP_4_LEFT
+
+# Lectura documental de prueba sin imprimir ni guardar datos personales
+dotnet run --project Src/AgenteBiometrico.csproj -- --scan-document
 ```
+
+Por omisión el agente escucha únicamente en `ws://127.0.0.1:8443`. Para el
+modo requerido por el frontend HTTPS, configura un certificado PFX confiable
+por el navegador:
+
+```powershell
+$env:BIOMETRIC_AGENT_CERT_PATH = 'C:\ruta\agente-local.pfx'
+$env:BIOMETRIC_AGENT_CERT_PASSWORD = 'contraseña-del-pfx'
+$env:BIOMETRIC_AGENT_PORT = '8443'
+dotnet run --project Src/AgenteBiometrico.csproj
+```
+
+Con certificado configurado el endpoint cambia automáticamente a
+`wss://127.0.0.1:8443`.
+
+## Contrato WebSocket inicial
+
+Comandos habilitados:
+
+- `GET_DEVICE_STATUS`
+- `START_FINGERPRINT_CAPTURE`
+- `START_DOCUMENT_SCAN`
+
+Ejemplo de captura:
+
+```json
+{
+  "command": "START_FINGERPRINT_CAPTURE",
+  "sessionId": "SESS-987654",
+  "fingerType": "SLAP_4_LEFT",
+  "missingFingers": ["LEFT_RING"],
+  "timeoutSeconds": 30
+}
+```
+
+`fingerType` acepta `SLAP_4_LEFT`, `SLAP_4_RIGHT` y `THUMBS_2`. El agente
+emite primero `FINGERPRINT_CAPTURE_STARTED` y después
+`FINGERPRINT_CAPTURED`, o `ERROR` con código estable y, cuando corresponde,
+el código nativo del fabricante. `missingFingers` es opcional y sólo puede
+contener posiciones de la plancha solicitada. El resultado contiene el WSQ de
+la plancha y un arreglo `samples` con posición ISO, NFIQ, LFD, WSQ y plantilla
+ISO/IEC 19794-2 de cada dedo.
+
+Ejemplo de lectura documental:
+
+```json
+{
+  "command": "START_DOCUMENT_SCAN",
+  "sessionId": "SESS-987654",
+  "readRfid": true,
+  "timeoutSeconds": 60
+}
+```
+
+El evento `DOCUMENT_SCANNED` contiene tipo detectado, líneas y campos MRZ,
+imágenes PNG, códigos de barras y resultados BAC/PACE/AA/CA/PA/DG cuando se
+trata de un documento electrónico. La clasificación OCR específica de
+INE/IFE/INM se incorporará como una capa posterior sobre estas imágenes.

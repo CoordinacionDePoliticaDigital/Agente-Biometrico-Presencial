@@ -1,0 +1,33 @@
+{
+  "templateId": "INE_MX_BASE_V1",
+  "documentFamily": "INE_IFE",
+  "country": "MEX",
+  "status": "CALIBRATION_REQUIRED",
+  "canonicalAspectRatio": 1.5858,
+  "sides": {
+    "front": {
+      "requiredSignals": ["PORTRAIT", "INE_WORDMARK", "PERSONAL_DATA_LABELS"],
+      "forbiddenSignals": ["TD1_MRZ"],
+      "fields": [
+        { "name": "fullName", "roi": null, "required": true },
+        { "name": "address", "roi": null, "required": true },
+        { "name": "electorKey", "roi": null, "required": true, "pattern": "^[A-Z0-9]{12,20}$" },
+        { "name": "curp", "roi": null, "required": false, "pattern": "^[A-Z]{4}[0-9]{6}[HM][A-Z]{5}[A-Z0-9][0-9]$" },
+        { "name": "birthDate", "roi": null, "required": true },
+        { "name": "validity", "roi": null, "required": true },
+        { "name": "portrait", "roi": null, "required": true }
+      ]
+    },
+    "back": {
+      "requiredSignalsAny": ["TD1_MRZ", "BARCODE", "QR"],
+      "fields": [
+        { "name": "mrz", "roi": null, "required": true },
+        { "name": "barcodes", "roi": null, "required": false }
+      ]
+    }
+  },
+  "notes": [
+    "Las ROI quedan deliberadamente sin coordenadas hasta calibrarlas con muestras autorizadas de cada modelo de credencial.",
+    "Una plantilla calibrada debe versionarse por modelo de INE/IFE y nunca inferirse de una sola muestra."
+  ]
+}
