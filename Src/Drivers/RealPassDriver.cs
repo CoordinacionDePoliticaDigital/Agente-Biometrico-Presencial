@@ -517,10 +517,34 @@ public sealed class RealPassDriver : IDisposable
                 parsedMrz.bPassNumCDR,
                 parsedMrz.bBirthCDR,
                 parsedMrz.bExpiryCDR,
-                parsedMrz.bCompositeCDR) : null,
+                parsedMrz.bCompositeCDR,
+                ExtractMexicanCic(mrzLines, parsedMrz.strDocNum)) : null,
             Images: images,
             Barcodes: barcodes,
             ElectronicDocument: BuildElectronicDocument(synthesis));
+    }
+
+    private static string? ExtractMexicanCic(
+        IReadOnlyList<string> mrzLines,
+        string? documentNumber)
+    {
+        var firstLine = mrzLines
+            .Select(line => new string((line ?? string.Empty)
+                .ToUpperInvariant()
+                .Where(character => char.IsLetterOrDigit(character) || character == '<')
+                .ToArray()))
+            .FirstOrDefault(line => line.StartsWith("IDMEX", StringComparison.Ordinal) && line.Length > 14);
+        if (firstLine is not null)
+        {
+            var value = firstLine.Substring(5, 10).Replace("<", string.Empty);
+            if (value.Length == 10 && value.All(char.IsDigit))
+            {
+                return value;
+            }
+        }
+
+        var normalized = new string((documentNumber ?? string.Empty).Where(char.IsDigit).ToArray());
+        return normalized.Length == 10 ? normalized : null;
     }
 
     private void AddSdkImage(

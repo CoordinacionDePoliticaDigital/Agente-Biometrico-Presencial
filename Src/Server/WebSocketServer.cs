@@ -14,7 +14,7 @@ namespace AgenteBiometricoPresencial.Server;
 
 public sealed class BiometricWebSocketServer : IDisposable
 {
-    private const string AgentVersion = "0.6.0";
+    private const string AgentVersion = "0.6.1";
     private static long _globalConnectionSequence;
     private static readonly JsonSerializerSettings JsonSettings = new()
     {
@@ -117,6 +117,7 @@ public sealed class BiometricWebSocketServer : IDisposable
                 @event = "CONNECTED_HANDSHAKE",
                 status = "READY",
                 agentVersion = AgentVersion,
+                stationName = Environment.MachineName.ToUpperInvariant(),
                 devices = GetDeviceStates()
             });
         };
@@ -440,6 +441,7 @@ public sealed class BiometricWebSocketServer : IDisposable
             timeoutSeconds,
             CancellationToken.None);
         var result = DocumentImageProcessor.Process(rawResult, documentSide);
+        result = DocumentMrzFallbackProcessor.Enrich(result, documentSide);
         var sideValidation = ValidateDocumentSide(result, documentSide);
         var eligibilityValidation = ValidateDocumentEligibility(result, documentSide);
         if (!sideValidation.Accepted)
@@ -481,6 +483,14 @@ public sealed class BiometricWebSocketServer : IDisposable
         });
     }
 
+    private static bool HasMeaningfulMrz(DocumentCaptureResult result)
+    {
+        return result.MrzLines.Any(line => !string.IsNullOrWhiteSpace(line) && line.Length >= 25) ||
+               (result.Mrz is not null &&
+                !string.IsNullOrWhiteSpace(result.Mrz.IssuingState) &&
+                !string.IsNullOrWhiteSpace(result.Mrz.DocumentNumber));
+    }
+
     private static DocumentEligibilityValidation ValidateDocumentEligibility(
         DocumentCaptureResult result,
         string expectedSide)
@@ -488,7 +498,7 @@ public sealed class BiometricWebSocketServer : IDisposable
         var evidence = new List<string>();
         var documentType = result.DocumentType ?? string.Empty;
         var normalizedType = documentType.ToUpperInvariant();
-        var hasMrz = result.Mrz is not null || result.MrzLines.Count > 0;
+        var hasMrz = HasMeaningfulMrz(result);
         var isPassport = normalizedType.Contains("PASSPORT", StringComparison.Ordinal);
         var isDriverLicense = normalizedType.Contains("ISO18013", StringComparison.Ordinal) ||
                               normalizedType.Contains("DRIVER", StringComparison.Ordinal) ||
@@ -587,7 +597,7 @@ public sealed class BiometricWebSocketServer : IDisposable
     {
         var evidence = new List<string>();
         var isPassport = result.DocumentType.Contains("PASSPORT", StringComparison.OrdinalIgnoreCase);
-        var hasMrz = result.Mrz is not null || result.MrzLines.Count > 0;
+        var hasMrz = HasMeaningfulMrz(result);
         var hasBarcode = result.Barcodes.Count > 0;
         var hasConfirmedPortrait = result.Images.Any(image => image.Type == "PORTRAIT_FACE");
         var hasAuxiliaryPortrait = result.Images.Any(image => image.Type is

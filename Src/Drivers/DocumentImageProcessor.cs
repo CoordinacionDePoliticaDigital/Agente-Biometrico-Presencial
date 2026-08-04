@@ -156,11 +156,16 @@ public static class DocumentImageProcessor
         using var bottom = new Mat(binary, new Rect(0, bottomY, binary.Width, binary.Height - bottomY));
         var topDensity = Cv2.CountNonZero(top) / (double)(top.Width * top.Height);
         var bottomDensity = Cv2.CountNonZero(bottom) / (double)(bottom.Width * bottom.Height);
-        var rotation = bottomDensity > topDensity * 1.05 ? 180 : 0;
+        // Una diferencia pequeña de densidad no distingue la MRZ de los
+        // bloques PDF417/QR de una INE. No se rota con evidencia LOW: el OCR
+        // TD1 posterior decidirá 0°/180° de forma verificable.
+        var dominantRatio = Math.Max(topDensity, bottomDensity) /
+                            Math.Max(0.0001, Math.Min(topDensity, bottomDensity));
+        var rotation = 0;
         return new DocumentOrientationResult(
             rotation,
-            $"distribución gráfica del reverso (superior={topDensity:P0}, inferior={bottomDensity:P0})",
-            Math.Max(topDensity, bottomDensity) > Math.Min(topDensity, bottomDensity) * 1.25 ? "MEDIUM" : "LOW");
+            $"orientación pendiente de OCR MRZ (superior={topDensity:P0}, inferior={bottomDensity:P0})",
+            dominantRatio > 1.8 ? "MEDIUM" : "LOW");
     }
 
     private static DocumentOrientationResult? DetermineBackRotationFromBarcodes(
@@ -535,6 +540,24 @@ public static class DocumentImageProcessor
         Cv2.MorphologyEx(backgroundDifference, backgroundDifference, MorphTypes.Open, cleanupKernel, iterations: 1);
         AddCandidate(candidates, backgroundDifference, reduced.Size(), "diferencia contra fondo");
 
+        // Las credenciales oscuras o colocadas a 180° pueden compartir luma
+        // con la cama del lector. La textura impresa sigue siendo detectable:
+        // el umbral adaptativo une texto, retrato y códigos dentro del borde
+        // físico sin depender del color del fondo.
+        using var adaptive = new Mat();
+        Cv2.AdaptiveThreshold(
+            gray,
+            adaptive,
+            255,
+            AdaptiveThresholdTypes.GaussianC,
+            ThresholdTypes.BinaryInv,
+            51,
+            7);
+        using var textureKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new OpenCvSharp.Size(35, 23));
+        Cv2.MorphologyEx(adaptive, adaptive, MorphTypes.Close, textureKernel, iterations: 2);
+        Cv2.MorphologyEx(adaptive, adaptive, MorphTypes.Open, cleanupKernel, iterations: 1);
+        AddCandidate(candidates, adaptive, reduced.Size(), "envolvente de textura adaptativa");
+
         var candidate = candidates.MaxBy(item => item.Score);
 
         if (candidate is null)
@@ -588,15 +611,7 @@ public static class DocumentImageProcessor
                 continue;
             }
 
-            var perimeter = Cv2.ArcLength(contour, true);
-            var polygon = Cv2.ApproxPolyDP(contour, perimeter * 0.025, true);
-            var candidate = polygon.Length == 4
-                ? polygon
-                : minimumRectangle.Points()
-                    .Select(point => new OpenCvSharp.Point(
-                        (int)Math.Round(point.X),
-                        (int)Math.Round(point.Y)))
-                    .ToArray();
+            var candidate = ApproximateCardQuadrilateral(contour, minimumRectangle);
             var aspectScore = Math.Max(0.1, 1 - Math.Abs(ratio - Id1AspectRatio) / Id1AspectRatio);
             var expectedAreaScore = Math.Max(0.15, 1 - Math.Abs(areaFraction - 0.30) / 0.30);
             var score = contourArea * (0.35 + Math.Min(1, rectangularity)) * aspectScore * expectedAreaScore;
@@ -613,6 +628,37 @@ public static class DocumentImageProcessor
         }
 
         return best;
+    }
+
+    private static OpenCvSharp.Point[] ApproximateCardQuadrilateral(
+        OpenCvSharp.Point[] contour,
+        RotatedRect minimumRectangle)
+    {
+        var hull = Cv2.ConvexHull(contour);
+        var perimeter = Cv2.ArcLength(hull, true);
+        OpenCvSharp.Point[]? best = null;
+        var bestArea = 0d;
+        foreach (var epsilon in new[] { 0.008, 0.012, 0.018, 0.025, 0.035, 0.05, 0.07 })
+        {
+            var polygon = Cv2.ApproxPolyDP(hull, perimeter * epsilon, true);
+            if (polygon.Length != 4 || !Cv2.IsContourConvex(polygon))
+            {
+                continue;
+            }
+
+            var area = Math.Abs(Cv2.ContourArea(polygon));
+            if (area > bestArea)
+            {
+                best = polygon;
+                bestArea = area;
+            }
+        }
+
+        return best ?? minimumRectangle.Points()
+            .Select(point => new OpenCvSharp.Point(
+                (int)Math.Round(point.X),
+                (int)Math.Round(point.Y)))
+            .ToArray();
     }
 
     private static void AddCandidate(

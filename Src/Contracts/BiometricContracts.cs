@@ -73,7 +73,8 @@ public sealed record DocumentMrzResult(
     bool DocumentNumberCheckDigitValid,
     bool BirthDateCheckDigitValid,
     bool ExpiryDateCheckDigitValid,
-    bool CompositeCheckDigitValid);
+    bool CompositeCheckDigitValid,
+    string? Cic = null);
 
 public sealed record DocumentImageResult(
     string Type,

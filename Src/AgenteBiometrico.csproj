@@ -22,6 +22,7 @@
     <PackageReference Include="OpenCvSharp4" Version="4.13.0.20260627" />
     <PackageReference Include="OpenCvSharp4.runtime.win" Version="4.13.0.20260627" />
     <PackageReference Include="System.Drawing.Common" Version="8.0.0" />
+    <PackageReference Include="Tesseract" Version="5.2.0" />
   </ItemGroup>
 
   <!-- Referencia al ensamblado Managed de RealPassSDK si está presente en C:\Program Files\Xperix -->
@@ -37,6 +38,10 @@
     <None Condition="Exists('C:\Program Files\Xperix\RealPassSDK\Bin\x64\data\face\haarcascade_frontalface_alt2.xml')"
           Include="C:\Program Files\Xperix\RealPassSDK\Bin\x64\data\face\haarcascade_frontalface_alt2.xml"
           Link="Assets\haarcascade_frontalface_alt2.xml"
+          CopyToOutputDirectory="PreserveNewest" />
+    <None Condition="Exists('C:\Program Files\Xperix\RealPassSDK\Bin\x64\data\tessdata\OCRB.traineddata')"
+          Include="C:\Program Files\Xperix\RealPassSDK\Bin\x64\data\tessdata\OCRB.traineddata"
+          Link="tessdata\OCRB.traineddata"
           CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
